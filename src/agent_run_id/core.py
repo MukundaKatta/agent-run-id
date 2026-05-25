@@ -1,300 +1,261 @@
-"""
-agent_run_id — generate, thread, and propagate run IDs through agent loops.
+"""Generate, format, and thread run IDs through LLM agent pipelines.
 
-Gives every agent run a stable ID you can attach to messages, logs,
-tool calls, and traces so the whole session is traceable end-to-end.
-Zero dependencies (stdlib: uuid, time, contextvars).
+Run IDs help correlate logs, spans, and events across an agent turn.
+:class:`RunId` handles generation and formatting; :class:`RunIdStore`
+is a lightweight in-process registry that maps session keys to run IDs.
+
+Example::
+
+    from agent_run_id import RunId, RunIdStore
+
+    # Generate a run ID
+    run_id = RunId.generate()                # "run_7f4a2b1c"
+    sub_id = run_id.child("step_1")          # "run_7f4a2b1c.step_1"
+
+    # Thread it through a store
+    store = RunIdStore()
+    store.set("session:abc", run_id)
+
+    print(store.get("session:abc"))          # RunId("run_7f4a2b1c")
+    print(store.require("session:abc").full) # "run_7f4a2b1c"
 """
 
 from __future__ import annotations
 
-import contextvars
-import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 
-# ---------------------------------------------------------------------------
-# Core dataclass
-# ---------------------------------------------------------------------------
+class RunIdNotSetError(KeyError):
+    """Raised by :meth:`RunIdStore.require` when the key has no run ID."""
 
-@dataclass
+
+@dataclass(frozen=True)
 class RunId:
-    """
-    A stable identifier for a single agent run.
+    """An immutable run ID with optional hierarchy support.
 
     Attributes:
-        id: Full UUID string (with optional prefix).
-        prefix: Prefix used when building the ID.
-        created_at: Unix timestamp when this RunId was created.
+        value:    The core ID string (without prefix or parent).
+        prefix:   Short prefix for human readability (default ``"run"``).
+        parent:   Parent :class:`RunId` when this is a child/sub-run.
     """
 
-    id: str
+    value: str
     prefix: str = "run"
-    created_at: float = field(default_factory=time.time)
+    parent: RunId | None = field(default=None, compare=False)
+
+    # ------------------------------------------------------------------
+    # Factory
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def generate(cls, prefix: str = "run") -> RunId:
+        """Generate a new random run ID.
+
+        Uses the first 8 hex characters of a UUID4 for brevity.
+
+        Args:
+            prefix: Short prefix.  Defaults to ``"run"``.
+
+        Returns:
+            A new :class:`RunId`.
+        """
+        short = uuid.uuid4().hex[:8]
+        return cls(value=short, prefix=prefix)
+
+    @classmethod
+    def from_string(cls, s: str, prefix: str = "run") -> RunId:
+        """Construct a :class:`RunId` from a pre-existing string.
+
+        The string is used as-is for :attr:`value`.
+
+        Args:
+            s:      The raw ID value.
+            prefix: Prefix to attach.
+
+        Returns:
+            A :class:`RunId` wrapping *s*.
+        """
+        return cls(value=s, prefix=prefix)
+
+    # ------------------------------------------------------------------
+    # Hierarchy
+    # ------------------------------------------------------------------
+
+    def child(self, label: str) -> RunId:
+        """Create a child run ID that references this one.
+
+        The child's :attr:`full` string is ``{parent.full}.{label}``.
+
+        Args:
+            label: A short label for the child step.
+
+        Returns:
+            A new :class:`RunId` with ``parent=self``.
+        """
+        return RunId(value=label, prefix=self.prefix, parent=self)
+
+    # ------------------------------------------------------------------
+    # String representations
+    # ------------------------------------------------------------------
+
+    @property
+    def full(self) -> str:
+        """Full dotted-path representation including parent chain.
+
+        Examples:
+            ``"run_7f4a2b1c"`` for a root ID.
+            ``"run_7f4a2b1c.step_1"`` for a child.
+            ``"run_7f4a2b1c.step_1.attempt_2"`` for a grandchild.
+        """
+        if self.parent is None:
+            return f"{self.prefix}_{self.value}"
+        return f"{self.parent.full}.{self.value}"
 
     @property
     def short(self) -> str:
-        """First 8 hex characters after the prefix, for display."""
-        raw = self.id
-        if self.prefix and raw.startswith(self.prefix + "_"):
-            raw = raw[len(self.prefix) + 1:]
-        return raw[:8]
+        """Just the local segment (no parent prefix)."""
+        if self.parent is None:
+            return f"{self.prefix}_{self.value}"
+        return self.value
+
+    @property
+    def root(self) -> RunId:
+        """Walk up the parent chain and return the root run ID."""
+        if self.parent is None:
+            return self
+        return self.parent.root
+
+    @property
+    def depth(self) -> int:
+        """Nesting depth (0 for root, 1 for child, 2 for grandchild, …)."""
+        if self.parent is None:
+            return 0
+        return self.parent.depth + 1
+
+    # ------------------------------------------------------------------
+    # Extras
+    # ------------------------------------------------------------------
+
+    def as_dict(self) -> dict[str, Any]:
+        """Serialise to a plain dict (useful for logging)."""
+        return {
+            "run_id": self.full,
+            "root_id": self.root.full,
+            "depth": self.depth,
+        }
 
     def __str__(self) -> str:
-        return self.id
+        return self.full
 
     def __repr__(self) -> str:
-        return f"RunId({self.id!r})"
+        return f"RunId({self.full!r})"
 
 
-# ---------------------------------------------------------------------------
-# Generation
-# ---------------------------------------------------------------------------
+class RunIdStore:
+    """A lightweight registry mapping arbitrary keys to :class:`RunId` values.
 
-def generate_run_id(prefix: str = "run") -> str:
-    """
-    Generate a new unique run ID string.
-
-    Format: ``<prefix>_<uuid4_hex>``
-
-    Args:
-        prefix: String prepended to the UUID (default ``"run"``).
-                Set to ``""`` for a bare UUID.
-
-    Returns:
-        Run ID string, e.g. ``"run_4f3a..."``
-    """
-    uid = uuid.uuid4().hex
-    if prefix:
-        return f"{prefix}_{uid}"
-    return uid
-
-
-def make_run_id(prefix: str = "run") -> RunId:
-    """
-    Create a new :class:`RunId` instance.
-
-    Args:
-        prefix: Prefix for the ID string.
-
-    Returns:
-        :class:`RunId`
-    """
-    return RunId(id=generate_run_id(prefix), prefix=prefix)
-
-
-# ---------------------------------------------------------------------------
-# Tagging helpers
-# ---------------------------------------------------------------------------
-
-_TAG_KEY = "_run_id"
-
-
-def tag_message(message: dict[str, Any], run_id: RunId | str) -> dict[str, Any]:
-    """
-    Return a copy of *message* with the run ID injected.
-
-    The run ID is stored under ``"_run_id"`` (not sent to the API;
-    strip before sending with :func:`strip_tag`).
-
-    Args:
-        message: A message dict.
-        run_id: :class:`RunId` or string.
-
-    Returns:
-        New dict with ``_run_id`` key added.
-    """
-    tagged = dict(message)
-    tagged[_TAG_KEY] = str(run_id)
-    return tagged
-
-
-def tag_messages(
-    messages: list[dict[str, Any]],
-    run_id: RunId | str,
-) -> list[dict[str, Any]]:
-    """
-    Return a new list with run ID injected into every message.
-
-    Args:
-        messages: List of message dicts.
-        run_id: :class:`RunId` or string.
-
-    Returns:
-        New list of tagged dicts.
-    """
-    return [tag_message(m, run_id) for m in messages]
-
-
-def strip_tag(message: dict[str, Any]) -> dict[str, Any]:
-    """
-    Return a copy of *message* with the ``_run_id`` key removed.
-
-    Use this before sending to the API.
-
-    Args:
-        message: A possibly-tagged message dict.
-
-    Returns:
-        New dict without ``_run_id``.
-    """
-    return {k: v for k, v in message.items() if k != _TAG_KEY}
-
-
-def strip_tags(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Return a new list with ``_run_id`` stripped from every message.
-
-    Args:
-        messages: List of message dicts.
-
-    Returns:
-        New list without ``_run_id`` keys.
-    """
-    return [strip_tag(m) for m in messages]
-
-
-def extract_run_id(message: dict[str, Any]) -> str | None:
-    """
-    Extract the run ID from a tagged message.
-
-    Args:
-        message: A possibly-tagged message dict.
-
-    Returns:
-        Run ID string, or ``None`` if not present.
-    """
-    return message.get(_TAG_KEY)
-
-
-# ---------------------------------------------------------------------------
-# Context variable (propagate across function calls)
-# ---------------------------------------------------------------------------
-
-_current_run_id: contextvars.ContextVar[RunId | None] = contextvars.ContextVar(
-    "agent_run_id", default=None
-)
-
-
-def set_current_run_id(run_id: RunId | str) -> None:
-    """
-    Set the current run ID in the context.
-
-    Args:
-        run_id: :class:`RunId` or string. If a string is given, it is
-                wrapped in a :class:`RunId`.
-    """
-    if isinstance(run_id, str):
-        run_id = RunId(id=run_id)
-    _current_run_id.set(run_id)
-
-
-def get_current_run_id() -> RunId | None:
-    """
-    Get the current run ID from the context.
-
-    Returns:
-        :class:`RunId` or ``None`` if not set.
-    """
-    return _current_run_id.get()
-
-
-def require_run_id() -> RunId:
-    """
-    Get the current run ID, raising if not set.
-
-    Returns:
-        :class:`RunId`
-
-    Raises:
-        RuntimeError: If no run ID is set in the current context.
-    """
-    rid = _current_run_id.get()
-    if rid is None:
-        raise RuntimeError(
-            "No run ID is set in the current context. "
-            "Call set_current_run_id() or use RunContext first."
-        )
-    return rid
-
-
-def clear_run_id() -> None:
-    """Clear the current run ID from the context."""
-    _current_run_id.set(None)
-
-
-# ---------------------------------------------------------------------------
-# Context manager
-# ---------------------------------------------------------------------------
-
-class RunContext:
-    """
-    Context manager that sets (and restores) the current run ID.
-
-    Usage::
-
-        with RunContext() as ctx:
-            rid = ctx.run_id   # auto-generated
-            messages = tag_messages(messages, rid)
-
-        # Or supply an existing ID:
-        with RunContext(run_id="run_abc123") as ctx:
-            ...
+    Useful for correlating run IDs with sessions, requests, or threads.
     """
 
-    def __init__(
-        self,
-        run_id: RunId | str | None = None,
-        *,
-        prefix: str = "run",
-    ) -> None:
-        if run_id is None:
-            self.run_id = make_run_id(prefix)
-        elif isinstance(run_id, str):
-            self.run_id = RunId(id=run_id, prefix=prefix)
-        else:
-            self.run_id = run_id
-        self._token: contextvars.Token[RunId | None] | None = None
+    def __init__(self) -> None:
+        self._store: dict[str, RunId] = {}
 
-    def __enter__(self) -> RunContext:
-        self._token = _current_run_id.set(self.run_id)
+    # ------------------------------------------------------------------
+    # Writes
+    # ------------------------------------------------------------------
+
+    def set(self, key: str, run_id: RunId) -> RunIdStore:
+        """Store *run_id* under *key*.
+
+        Args:
+            key:    Arbitrary string key.
+            run_id: :class:`RunId` to associate.
+
+        Returns:
+            ``self`` for chaining.
+        """
+        self._store[key] = run_id
         return self
 
-    def __exit__(self, *_: Any) -> None:
-        if self._token is not None:
-            _current_run_id.reset(self._token)
+    def set_new(self, key: str, prefix: str = "run") -> RunId:
+        """Generate a new run ID, store it, and return it.
 
+        Args:
+            key:    Arbitrary string key.
+            prefix: Prefix for the generated ID.
 
-# ---------------------------------------------------------------------------
-# Annotation helper for logs / traces
-# ---------------------------------------------------------------------------
+        Returns:
+            The newly generated :class:`RunId`.
+        """
+        run_id = RunId.generate(prefix=prefix)
+        self._store[key] = run_id
+        return run_id
 
-def annotate(
-    data: dict[str, Any],
-    run_id: RunId | str | None = None,
-    *,
-    key: str = "run_id",
-) -> dict[str, Any]:
-    """
-    Return a copy of *data* annotated with the run ID.
+    def delete(self, key: str) -> RunIdStore:
+        """Remove the run ID for *key* (no-op if absent).
 
-    If *run_id* is ``None``, uses the current context run ID.
+        Returns:
+            ``self`` for chaining.
+        """
+        self._store.pop(key, None)
+        return self
 
-    Args:
-        data: Dict to annotate (log entry, trace event, etc.).
-        run_id: Override run ID, or ``None`` to use context.
-        key: Key to inject (default ``"run_id"``).
+    def clear(self) -> RunIdStore:
+        """Remove all entries.
 
-    Returns:
-        New dict with run ID added.
-    """
-    if run_id is None:
-        rid = get_current_run_id()
-    else:
-        rid = run_id
-    result = dict(data)
-    if rid is not None:
-        result[key] = str(rid)
-    return result
+        Returns:
+            ``self`` for chaining.
+        """
+        self._store.clear()
+        return self
+
+    # ------------------------------------------------------------------
+    # Reads
+    # ------------------------------------------------------------------
+
+    def get(self, key: str, default: RunId | None = None) -> RunId | None:
+        """Return the :class:`RunId` for *key*, or *default* if absent."""
+        return self._store.get(key, default)
+
+    def require(self, key: str) -> RunId:
+        """Return the :class:`RunId` for *key* or raise if absent.
+
+        Raises:
+            RunIdNotSetError: If *key* has no associated run ID.
+        """
+        if key not in self._store:
+            raise RunIdNotSetError(key)
+        return self._store[key]
+
+    def has(self, key: str) -> bool:
+        """Return ``True`` if *key* has an associated run ID."""
+        return key in self._store
+
+    def keys(self) -> list[str]:
+        """Return a sorted list of all stored keys."""
+        return sorted(self._store.keys())
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def count(self) -> int:
+        """Number of stored run IDs."""
+        return len(self._store)
+
+    @property
+    def is_empty(self) -> bool:
+        """``True`` if no run IDs are stored."""
+        return len(self._store) == 0
+
+    def __repr__(self) -> str:
+        return f"RunIdStore(count={self.count})"
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._store

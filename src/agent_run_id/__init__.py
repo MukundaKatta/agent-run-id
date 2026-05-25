@@ -1,33 +1,8 @@
-from .core import (
-    RunId,
-    RunContext,
-    generate_run_id,
-    make_run_id,
-    tag_message,
-    tag_messages,
-    strip_tag,
-    strip_tags,
-    extract_run_id,
-    set_current_run_id,
-    get_current_run_id,
-    require_run_id,
-    clear_run_id,
-    annotate,
-)
+"""Generate, format, and thread run IDs through LLM agent pipelines."""
 
-__all__ = [
-    "RunId",
-    "RunContext",
-    "generate_run_id",
-    "make_run_id",
-    "tag_message",
-    "tag_messages",
-    "strip_tag",
-    "strip_tags",
-    "extract_run_id",
-    "set_current_run_id",
-    "get_current_run_id",
-    "require_run_id",
-    "clear_run_id",
-    "annotate",
-]
+from __future__ import annotations
+
+from agent_run_id.core import RunId, RunIdNotSetError, RunIdStore
+
+__all__ = ["RunId", "RunIdStore", "RunIdNotSetError"]
+__version__ = "0.1.0"
