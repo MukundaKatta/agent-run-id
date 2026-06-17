@@ -2,7 +2,17 @@
 
 Generate, format, and thread run IDs through LLM agent pipelines.
 
-Zero dependencies. Supports hierarchical sub-run IDs for multi-step agents.
+Zero runtime dependencies. Pure standard library. Supports hierarchical
+sub-run IDs for multi-step agents so you can correlate logs, spans, and
+events across a single agent turn.
+
+## Why
+
+When an agent fans out into retrieval, generation, tool calls, and retries,
+every log line and trace span should carry an ID that says *which run* and
+*which step* it belongs to. `agent-run-id` gives you a tiny, immutable value
+object for exactly that, plus an in-process store for threading the active ID
+through a request or session.
 
 ## Install
 
@@ -67,6 +77,33 @@ Maps string keys to `RunId` values.
 | `clear()` | Remove all. Chainable. |
 | `keys()` | Sorted list of all keys. |
 | `count` | Number of stored IDs. |
+| `is_empty` | `True` when no IDs are stored. |
+
+## Equality and hashing
+
+`RunId` is a frozen dataclass, so it is hashable and usable as a dict key or
+set member. Equality is based on the **full dotted path** (`value`, `prefix`,
+and the entire `parent` chain). Two child IDs that share a label but descend
+from different roots are *not* equal:
+
+```python
+a = RunId.from_string("aaa").child("step")   # "run_aaa.step"
+b = RunId.from_string("bbb").child("step")   # "run_bbb.step"
+assert a != b
+assert len({a, b}) == 2
+```
+
+## Development
+
+```bash
+# Run the test suite (standard-library unittest only — no third-party deps):
+python3 -m unittest discover -s tests
+
+# Optional lint/format (requires the dev extra):
+pip install -e ".[dev]"
+ruff check src tests
+ruff format --check src tests
+```
 
 ## License
 

@@ -23,7 +23,7 @@ Example::
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -35,6 +35,11 @@ class RunIdNotSetError(KeyError):
 class RunId:
     """An immutable run ID with optional hierarchy support.
 
+    Equality (and hashing) is based on :attr:`value`, :attr:`prefix`, **and**
+    :attr:`parent`, so two run IDs are equal only when their full dotted paths
+    (:attr:`full`) are identical. In particular, ``a.child("x")`` and
+    ``b.child("x")`` are *not* equal when ``a != b``.
+
     Attributes:
         value:    The core ID string (without prefix or parent).
         prefix:   Short prefix for human readability (default ``"run"``).
@@ -43,7 +48,7 @@ class RunId:
 
     value: str
     prefix: str = "run"
-    parent: RunId | None = field(default=None, compare=False)
+    parent: RunId | None = None
 
     # ------------------------------------------------------------------
     # Factory
